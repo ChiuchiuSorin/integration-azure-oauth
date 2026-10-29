@@ -23,15 +23,13 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Predicate;
 
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Provider;
 import javax.inject.Singleton;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
+import org.apache.commons.lang3.function.FailableConsumer;
 import org.xwiki.component.annotation.Component;
 import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.model.reference.DocumentReferenceResolver;
@@ -66,6 +64,10 @@ public class DefaultEntraIDUsersManager implements EntraIDUsersManager
 {
     private static final String ENTRA_ISSUER = "login.microsoftonline.com";
 
+    // Read the subject and issuer from the database, to avoid loading the document of every user.
+    private static final String USER_REFERENCES_QUERY = "select doc.fullName, oidc.issuer, oidc.subject "
+        + "from Document doc, doc.object(" + OIDC_USER_CLASS + ") as oidc";
+
     @Inject
     private EntraIDApiClient entraIDApiClient;
 
@@ -92,77 +94,80 @@ public class DefaultEntraIDUsersManager implements EntraIDUsersManager
     @Override
     public Map<String, XWikiDocument> getXWikiUsersMap() throws Exception
     {
-        return getXWikiUsersMap(configurationStore.getDefaultConfiguration());
+        return getXWikiUsersMap(this.configurationStore.getDefaultConfiguration());
     }
 
     @Override
     public Map<String, XWikiDocument> getXWikiUsersMap(EntraIDClientConfiguration configuration)
         throws QueryException, XWikiException
     {
-        return toUsersMap(getXWikiUsers(configuration::matchesIssuer));
+        XWikiContext wikiContext = this.wikiContextProvider.get();
+        XWiki wiki = wikiContext.getWiki();
+
+        Map<String, XWikiDocument> userMap = new HashMap<>();
+        for (Map.Entry<String, DocumentReference> entry : getXWikiUserReferences(configuration).entrySet()) {
+            userMap.put(entry.getKey(), wiki.getDocument(entry.getValue(), wikiContext));
+        }
+        return userMap;
+    }
+
+    @Override
+    public Map<String, DocumentReference> getXWikiUserReferences(EntraIDClientConfiguration configuration)
+        throws QueryException
+    {
+        List<Object[]> results = this.queryManager.createQuery(USER_REFERENCES_QUERY, Query.XWQL)
+            .setWiki(this.wikiManager.getCurrentWikiId()).execute();
+
+        Map<String, DocumentReference> userReferences = new HashMap<>();
+        for (Object[] result : results) {
+            if (configuration.matchesIssuer((String) result[1])) {
+                userReferences.put((String) result[2], this.documentReferenceResolver.resolve((String) result[0]));
+            }
+        }
+        return userReferences;
     }
 
     @Override
     public List<XWikiDocument> getXWikiUsers() throws XWikiException, QueryException
     {
-        return getXWikiUsers(issuer -> issuer.contains(ENTRA_ISSUER));
-    }
-
-    @Override
-    public List<ExternalUser> getEntraServerUsers() throws Exception
-    {
-        return getEntraServerUsers(configurationStore.getDefaultConfiguration());
-    }
-
-    @Override
-    public List<ExternalUser> getEntraServerUsers(EntraIDClientConfiguration configuration) throws Exception
-    {
-        return toExternalUsers(entraIDApiClient.getUsers(configuration));
-    }
-
-    private List<XWikiDocument> getXWikiUsers(Predicate<String> issuerFilter) throws XWikiException, QueryException
-    {
         List<XWikiDocument> xwikiEntraUsers = new ArrayList<>();
-        XWikiContext wikiContext = wikiContextProvider.get();
+        XWikiContext wikiContext = this.wikiContextProvider.get();
         XWiki wiki = wikiContext.getWiki();
 
         List<DocumentReference> results = this.queryManager.createQuery(
                 ", BaseObject as obj where doc.fullName = obj.name and obj.className = :className", Query.HQL)
             .setWiki(this.wikiManager.getCurrentWikiId()).bindValue("className", OIDC_USER_CLASS)
-            .addFilter(documentReferenceFilter).execute();
+            .addFilter(this.documentReferenceFilter).execute();
 
         for (DocumentReference userRef : results) {
             XWikiDocument userDoc = wiki.getDocument(userRef, wikiContext);
-            BaseObject oidcObj = userDoc.getXObject(documentReferenceResolver.resolve(OIDC_USER_CLASS));
+            BaseObject oidcObj = userDoc.getXObject(this.documentReferenceResolver.resolve(OIDC_USER_CLASS));
             String issuer = oidcObj.getField("issuer").toFormString();
-            if (issuerFilter.test(issuer)) {
+            if (issuer.contains(ENTRA_ISSUER)) {
                 xwikiEntraUsers.add(userDoc);
             }
         }
         return xwikiEntraUsers;
     }
 
-    private Map<String, XWikiDocument> toUsersMap(List<XWikiDocument> users)
+    @Override
+    public List<ExternalUser> getEntraServerUsers() throws Exception
     {
-        Map<String, XWikiDocument> userMap = new HashMap<>();
-
-        for (XWikiDocument userDoc : users) {
-            BaseObject oidcObj = userDoc.getXObject(documentReferenceResolver.resolve(OIDC_USER_CLASS));
-            String subject = oidcObj.getField("subject").toFormString();
-            userMap.put(subject, userDoc);
-        }
-        return userMap;
+        return getEntraServerUsers(this.configurationStore.getDefaultConfiguration());
     }
 
-    private List<ExternalUser> toExternalUsers(JSONArray users)
+    @Override
+    public List<ExternalUser> getEntraServerUsers(EntraIDClientConfiguration configuration) throws Exception
     {
         List<ExternalUser> externalUsers = new ArrayList<>();
-        for (int i = 0; i < users.length(); i++) {
-            JSONObject user = users.getJSONObject(i);
-            String id = user.optString("id");
-            Boolean enabled = user.optBoolean("accountEnabled");
-            externalUsers.add(new ExternalUser(id, enabled));
-        }
+        forEachEntraServerUsersPage(configuration, externalUsers::addAll);
         return externalUsers;
+    }
+
+    @Override
+    public void forEachEntraServerUsersPage(EntraIDClientConfiguration configuration,
+        FailableConsumer<List<ExternalUser>, Exception> handler) throws Exception
+    {
+        this.entraIDApiClient.forEachUsersPage(configuration, handler);
     }
 }

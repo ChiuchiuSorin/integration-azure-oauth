@@ -19,13 +19,14 @@
  */
 package com.xwiki.azureoauth.internal.user;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import javax.inject.Named;
 import javax.inject.Provider;
 
-import org.json.JSONArray;
+import org.apache.commons.lang3.function.FailableConsumer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
@@ -54,7 +55,13 @@ import com.xwiki.azureoauth.user.ExternalUser;
 import static com.xwiki.azureoauth.internal.configuration.DefaultEntraIDConfiguration.OIDC_USER_CLASS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -89,15 +96,6 @@ class DefaultEntraIDUsersManagerTest
 
     @Mock
     private XWikiDocument userDoc3;
-
-    @Mock
-    private PropertyInterface property1;
-
-    @Mock
-    private PropertyInterface property2;
-
-    @Mock
-    private PropertyInterface property3;
 
     @Mock
     private PropertyInterface property4;
@@ -155,6 +153,9 @@ class DefaultEntraIDUsersManagerTest
     private Query query;
 
     @Mock
+    private Query referencesQuery;
+
+    @Mock
     private XWiki wiki;
 
     @BeforeEach
@@ -187,17 +188,26 @@ class DefaultEntraIDUsersManagerTest
         when(property4.toFormString()).thenReturn("https://login.microsoftonline.com/etc");
         when(property5.toFormString()).thenReturn("issuer2");
         when(property6.toFormString()).thenReturn("https://login.microsoftonline.com/etc");
+
+        when(queryManager.createQuery("select doc.fullName, oidc.issuer, oidc.subject "
+            + "from Document doc, doc.object(XWiki.OIDC.UserClass) as oidc", Query.XWQL)).thenReturn(referencesQuery);
+        when(referencesQuery.setWiki("wiki_id")).thenReturn(referencesQuery);
+        when(referencesQuery.execute()).thenReturn(
+            List.of(new Object[] { "XWiki.User1", "https://login.microsoftonline.com/tenant/v2.0", "subject1" },
+                new Object[] { "XWiki.User2", "issuer2", "subject2" },
+                new Object[] { "XWiki.User3", "https://login.microsoftonline.com/other/v2.0", "subject3" }));
+        when(documentReferenceResolver.resolve("XWiki.User1")).thenReturn(documentReference1);
+        when(documentReferenceResolver.resolve("XWiki.User2")).thenReturn(documentReference2);
+        when(documentReferenceResolver.resolve("XWiki.User3")).thenReturn(documentReference3);
+        when(defaultConfiguration.matchesIssuer("https://login.microsoftonline.com/tenant/v2.0")).thenReturn(true);
     }
 
     @Test
     void getEntraServerUsersTest() throws Exception
     {
-        String jsonBody =
-            "[{ \"id\": \"user1\", \"accountEnabled\": true },{ \"id\": \"user2\", \"accountEnabled\": false },"
-                + "{ \"id\": \"user3\", \"accountEnabled\": true }]";
-
-        JSONArray jsonArray = new JSONArray(jsonBody);
-        when(entraIDApiClient.getUsers(defaultConfiguration)).thenReturn(jsonArray);
+        mockEntraServerUsersPages(defaultConfiguration,
+            List.of(new ExternalUser("user1", true), new ExternalUser("user2", false),
+                new ExternalUser("user3", true)));
         List<ExternalUser> externalUsers = defaultEntraIDUsersManager.getEntraServerUsers();
         assertEquals("user1", externalUsers.get(0).getId());
         assertFalse(externalUsers.get(1).isEnabled());
@@ -207,47 +217,81 @@ class DefaultEntraIDUsersManagerTest
     @Test
     void getEntraUsersMapTest() throws Exception
     {
-        when(object1.getField("subject")).thenReturn(property1);
-        when(property1.toFormString()).thenReturn("subject1");
-        when(property4.toFormString()).thenReturn("https://login.microsoftonline.com/tenant/v2.0");
-        when(defaultConfiguration.matchesIssuer("https://login.microsoftonline.com/tenant/v2.0")).thenReturn(true);
-
         // Only the users of the default configuration's tenant are returned.
         assertEquals(Map.of("subject1", userDoc1), defaultEntraIDUsersManager.getXWikiUsersMap());
     }
 
-
     @Test
     void getEntraUsersMapForConfiguration() throws Exception
     {
-        when(object1.getField("subject")).thenReturn(property1);
-        when(property1.toFormString()).thenReturn("subject1");
         EntraIDClientConfiguration configuration = mock(EntraIDClientConfiguration.class);
-        when(configuration.matchesIssuer("https://login.microsoftonline.com/etc")).thenReturn(false);
-        when(configuration.matchesIssuer("issuer2")).thenReturn(false);
-        when(property4.toFormString()).thenReturn("https://login.microsoftonline.com/tenant/v2.0");
-        when(configuration.matchesIssuer("https://login.microsoftonline.com/tenant/v2.0")).thenReturn(true);
+        when(configuration.matchesIssuer("https://login.microsoftonline.com/other/v2.0")).thenReturn(true);
 
-        assertEquals(Map.of("subject1", userDoc1), defaultEntraIDUsersManager.getXWikiUsersMap(configuration));
+        assertEquals(Map.of("subject3", userDoc3), defaultEntraIDUsersManager.getXWikiUsersMap(configuration));
+    }
+
+    @Test
+    void getXWikiUserReferences() throws Exception
+    {
+        EntraIDClientConfiguration configuration = mock(EntraIDClientConfiguration.class);
+        when(configuration.matchesIssuer("https://login.microsoftonline.com/tenant/v2.0")).thenReturn(true);
+        when(configuration.matchesIssuer("https://login.microsoftonline.com/other/v2.0")).thenReturn(true);
+
+        assertEquals(Map.of("subject1", documentReference1, "subject3", documentReference3),
+            defaultEntraIDUsersManager.getXWikiUserReferences(configuration));
+        // The user documents are not loaded.
+        verify(wiki, never()).getDocument(any(DocumentReference.class), any(XWikiContext.class));
     }
 
     @Test
     void getEntraServerUsersForConfiguration() throws Exception
     {
         EntraIDClientConfiguration configuration = mock(EntraIDClientConfiguration.class);
-        when(entraIDApiClient.getUsers(configuration))
-            .thenReturn(new JSONArray("[{ \"id\": \"user1\", \"accountEnabled\": false }]"));
+        mockEntraServerUsersPages(configuration, List.of(new ExternalUser("user1", false)),
+            List.of(new ExternalUser("user2", true)));
 
         List<ExternalUser> externalUsers = defaultEntraIDUsersManager.getEntraServerUsers(configuration);
 
-        assertEquals(1, externalUsers.size());
+        assertEquals(2, externalUsers.size());
         assertEquals("user1", externalUsers.get(0).getId());
         assertFalse(externalUsers.get(0).isEnabled());
+        assertEquals("user2", externalUsers.get(1).getId());
+        assertTrue(externalUsers.get(1).isEnabled());
+    }
+
+    @Test
+    void forEachEntraServerUsersPage() throws Exception
+    {
+        EntraIDClientConfiguration configuration = mock(EntraIDClientConfiguration.class);
+        mockEntraServerUsersPages(configuration, List.of(new ExternalUser("user1", false)),
+            List.of(new ExternalUser("user2", true)));
+
+        List<List<ExternalUser>> pages = new ArrayList<>();
+        defaultEntraIDUsersManager.forEachEntraServerUsersPage(configuration, pages::add);
+
+        assertEquals(2, pages.size());
+        assertEquals("user1", pages.get(0).get(0).getId());
+        assertFalse(pages.get(0).get(0).isEnabled());
+        assertEquals("user2", pages.get(1).get(0).getId());
+        assertTrue(pages.get(1).get(0).isEnabled());
     }
 
     @Test
     void getEntraUsersTest() throws QueryException, XWikiException
     {
         assertEquals(List.of(userDoc1, userDoc3), defaultEntraIDUsersManager.getXWikiUsers());
+    }
+
+    @SafeVarargs
+    private void mockEntraServerUsersPages(EntraIDClientConfiguration configuration, List<ExternalUser>... pages)
+        throws Exception
+    {
+        doAnswer(invocation -> {
+            FailableConsumer<List<ExternalUser>, Exception> handler = invocation.getArgument(1);
+            for (List<ExternalUser> page : pages) {
+                handler.accept(page);
+            }
+            return null;
+        }).when(entraIDApiClient).forEachUsersPage(eq(configuration), any());
     }
 }

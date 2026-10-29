@@ -25,6 +25,7 @@ import java.util.Map;
 import javax.inject.Named;
 import javax.inject.Provider;
 
+import org.apache.commons.lang3.function.FailableConsumer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
@@ -47,6 +48,8 @@ import com.xwiki.azureoauth.user.ExternalUser;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -90,6 +93,15 @@ class EntraIDUsersSyncManagerTest
     private DocumentReference userClassDocRef;
 
     @Mock
+    private DocumentReference userRef1;
+
+    @Mock
+    private DocumentReference userRef2;
+
+    @Mock
+    private DocumentReference userRef3;
+
+    @Mock
     private XWikiDocument userDoc1;
 
     @Mock
@@ -112,11 +124,13 @@ class EntraIDUsersSyncManagerTest
         when(wikiManager.getCurrentWikiId()).thenReturn("testWiki");
         when(configurationStore.getDefaultConfiguration()).thenReturn(defaultConfiguration);
         when(defaultConfiguration.hasSpecificTenant()).thenReturn(true);
-        when(entraIdUsersManager.getXWikiUsersMap(defaultConfiguration)).thenReturn(
-            Map.of("subject1", userDoc1, "subject2", userDoc2, "subject3", userDoc3));
-        List<ExternalUser> externalUsers =
-            List.of(new ExternalUser("subject1", true), new ExternalUser("subject2", false));
-        when(entraIdUsersManager.getEntraServerUsers(defaultConfiguration)).thenReturn(externalUsers);
+        when(entraIdUsersManager.getXWikiUserReferences(defaultConfiguration)).thenReturn(
+            Map.of("subject1", userRef1, "subject2", userRef2, "subject3", userRef3));
+        mockEntraServerUsersPages(defaultConfiguration,
+            List.of(new ExternalUser("subject1", true), new ExternalUser("subject2", false)));
+        when(wiki.getDocument(userRef1, wikiContext)).thenReturn(userDoc1);
+        when(wiki.getDocument(userRef2, wikiContext)).thenReturn(userDoc2);
+        when(wiki.getDocument(userRef3, wikiContext)).thenReturn(userDoc3);
 
         when(documentReferenceResolver.resolve("XWiki.XWikiUsers")).thenReturn(userClassDocRef);
         when(userDoc2.getXObject(userClassDocRef)).thenReturn(objectUserClass2);
@@ -143,10 +157,9 @@ class EntraIDUsersSyncManagerTest
     {
         EntraIDClientConfiguration configuration = mock(EntraIDClientConfiguration.class);
         when(configuration.hasSpecificTenant()).thenReturn(true);
-        when(entraIdUsersManager.getXWikiUsersMap(configuration)).thenReturn(Map.of("subject1", userDoc1,
-            "subject3", userDoc3));
-        when(entraIdUsersManager.getEntraServerUsers(configuration))
-            .thenReturn(List.of(new ExternalUser("subject1", false)));
+        when(entraIdUsersManager.getXWikiUserReferences(configuration)).thenReturn(
+            Map.of("subject1", userRef1, "subject3", userRef3));
+        mockEntraServerUsersPages(configuration, List.of(new ExternalUser("subject1", false)));
         BaseObject objectUserClass1 = mock(BaseObject.class);
         when(userDoc1.getXObject(userClassDocRef)).thenReturn(objectUserClass1);
 
@@ -190,5 +203,49 @@ class EntraIDUsersSyncManagerTest
 
         verify(wiki, never()).deleteDocument(any(), any());
         verify(objectUserClass2).set("active", 0, wikiContext);
+    }
+
+    @Test
+    void syncUsersWithSeveralPages() throws Exception
+    {
+        mockEntraServerUsersPages(defaultConfiguration, List.of(new ExternalUser("subject1", true)),
+            List.of(new ExternalUser("subject2", false)));
+
+        syncManager.syncUsers(true, true);
+
+        verify(wiki).deleteDocument(userDoc3, wikiContext);
+        verify(wiki, never()).deleteDocument(userDoc1, wikiContext);
+        verify(wiki, never()).deleteDocument(userDoc2, wikiContext);
+        verify(objectUserClass2).set("active", 0, wikiContext);
+    }
+
+    @Test
+    void syncUsersDoesNotRemoveWhenAPageFails() throws Exception
+    {
+        doAnswer(invocation -> {
+            FailableConsumer<List<ExternalUser>, Exception> handler = invocation.getArgument(1);
+            handler.accept(List.of(new ExternalUser("subject2", false)));
+            throw new RuntimeException("Graph request did not return a valid response.");
+        }).when(entraIdUsersManager).forEachEntraServerUsersPage(eq(defaultConfiguration), any());
+
+        assertThrows(RuntimeException.class, () -> syncManager.syncUsers(true, true));
+
+        // The users of the missing pages can't be told apart from the removed ones, so nothing is removed.
+        verify(wiki, never()).deleteDocument(any(), any());
+        // The users disabled before the failure stay disabled, since they are disabled on the Entra ID server.
+        verify(objectUserClass2).set("active", 0, wikiContext);
+    }
+
+    @SafeVarargs
+    private void mockEntraServerUsersPages(EntraIDClientConfiguration configuration, List<ExternalUser>... pages)
+        throws Exception
+    {
+        doAnswer(invocation -> {
+            FailableConsumer<List<ExternalUser>, Exception> handler = invocation.getArgument(1);
+            for (List<ExternalUser> page : pages) {
+                handler.accept(page);
+            }
+            return null;
+        }).when(entraIdUsersManager).forEachEntraServerUsersPage(eq(configuration), any());
     }
 }

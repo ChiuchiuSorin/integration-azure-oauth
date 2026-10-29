@@ -35,7 +35,7 @@
       functionalities have been replaced by OIDC. Removing this module is also necessary to allow the user to select
       the Authentication service. -->
     <xwiki.extension.features>com.xwiki.identity-oauth:identity-oauth-api</xwiki.extension.features>
-    <xwiki.jacoco.instructionRatio>0.92</xwiki.jacoco.instructionRatio>
+    <xwiki.jacoco.instructionRatio>0.93</xwiki.jacoco.instructionRatio>
     <xwiki.extension.namespaces>{root}</xwiki.extension.namespaces>
   </properties>
   <dependencies>

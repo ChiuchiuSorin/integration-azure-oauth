@@ -22,7 +22,9 @@ package com.xwiki.azureoauth.user;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.commons.lang3.function.FailableConsumer;
 import org.xwiki.component.annotation.Role;
+import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.query.QueryException;
 import org.xwiki.stability.Unstable;
 
@@ -73,8 +75,8 @@ public interface EntraIDUsersManager
     List<ExternalUser> getEntraServerUsers() throws Exception;
 
     /**
-     * Get a {@link Map} of internal users that are created from the tenant of the given configuration, with the user
-     * id (subject) as the key.
+     * Get a {@link Map} of internal users that are created from the tenant of the given configuration, with the user id
+     * (subject) as the key.
      *
      * @param configuration the Entra ID client configuration the users were created from
      * @return the internal users that are created from the tenant of the given configuration
@@ -92,4 +94,30 @@ public interface EntraIDUsersManager
      * @since 2.3.0
      */
     List<ExternalUser> getEntraServerUsers(EntraIDClientConfiguration configuration) throws Exception;
+
+    /**
+     * Get the references of the internal users that are created from the tenant of the given configuration, with the
+     * user id (subject) as the key. Unlike {@link #getXWikiUsersMap(EntraIDClientConfiguration)}, the user documents
+     * are not loaded.
+     *
+     * @param configuration the Entra ID client configuration the users were created from
+     * @return the references of the internal users that are created from the tenant of the given configuration
+     * @throws QueryException if the query execution fails
+     * @since 2.3.0
+     */
+    Map<String, DocumentReference> getXWikiUserReferences(EntraIDClientConfiguration configuration)
+        throws QueryException;
+
+    /**
+     * Pass the users present on the Entra ID server of the given configuration to the given handler, one page at a
+     * time, so that they don't have to be held in memory all at once. If a page can't be retrieved, an exception is
+     * thrown and the next pages are not handled.
+     *
+     * @param configuration the Entra ID client configuration used to query the server
+     * @param handler the handler called for each page of users
+     * @throws Exception if there are any errors while getting or handling the users
+     * @since 2.3.0
+     */
+    void forEachEntraServerUsersPage(EntraIDClientConfiguration configuration,
+        FailableConsumer<List<ExternalUser>, Exception> handler) throws Exception;
 }

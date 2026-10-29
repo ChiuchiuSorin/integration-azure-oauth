@@ -19,10 +19,9 @@
  */
 package com.xwiki.azureoauth.internal.user.sync;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -30,10 +29,12 @@ import javax.inject.Provider;
 import javax.inject.Singleton;
 
 import org.xwiki.component.annotation.Component;
+import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.model.reference.DocumentReferenceResolver;
 
 import com.xpn.xwiki.XWiki;
 import com.xpn.xwiki.XWikiContext;
+import com.xpn.xwiki.XWikiException;
 import com.xpn.xwiki.doc.XWikiDocument;
 import com.xpn.xwiki.objects.BaseObject;
 import com.xwiki.azureoauth.configuration.EntraIDClientConfiguration;
@@ -78,14 +79,14 @@ public class EntraIDUsersSyncManager
      */
     public void syncUsers(boolean disable, boolean remove) throws Exception
     {
-        syncUsers(configurationStore.getDefaultConfiguration(), disable, remove);
+        syncUsers(this.configurationStore.getDefaultConfiguration(), disable, remove);
     }
 
     /**
-     * Synchronize the state of the XWiki users created from the tenant of the given configuration with their state
-     * from the Microsoft server. The users created from other tenants are left untouched. Removing users is refused
-     * when the configuration doesn't target a single tenant, since its users can't be told apart from the users of
-     * other tenants.
+     * Synchronize the state of the XWiki users created from the tenant of the given configuration with their state from
+     * the Microsoft server. The users created from other tenants are left untouched. Removing users is refused when the
+     * configuration doesn't target a single tenant, since its users can't be told apart from the users of other
+     * tenants.
      *
      * @param configuration the Entra ID client configuration to synchronize the users of
      * @param disable {@code true} if the sync should also sync disabled users, or {@code false} otherwise
@@ -102,33 +103,40 @@ public class EntraIDUsersSyncManager
                 "Cannot remove the users of the Entra ID client configuration [%s] because it doesn't target a "
                     + "single tenant.", configuration.getConfigurationName()));
         }
-        syncUsers(usersManager.getXWikiUsersMap(configuration), usersManager.getEntraServerUsers(configuration),
-            disable, remove);
-    }
+        // The users that the Entra ID server doesn't return have been removed from it.
+        Map<String, DocumentReference> missingUsers =
+            new HashMap<>(this.usersManager.getXWikiUserReferences(configuration));
+        this.usersManager.forEachEntraServerUsersPage(configuration,
+            externalUsers -> syncUsersPage(externalUsers, missingUsers, disable));
 
-    private void syncUsers(Map<String, XWikiDocument> usersMap, List<ExternalUser> externalUsers, boolean disable,
-        boolean remove) throws Exception
-    {
-        // We index the values in a map to improve performance.
-        Map<String, ExternalUser> externalUsersById = externalUsers.stream()
-            .collect(Collectors.toMap(ExternalUser::getId, Function.identity()));
-        XWikiContext wikiContext = wikiContextProvider.get();
-        XWiki wiki = wikiContext.getWiki();
-        for (Map.Entry<String, XWikiDocument> entry : usersMap.entrySet()) {
-            XWikiDocument userDoc = entry.getValue();
-            String subject = entry.getKey();
-            ExternalUser externalUser = externalUsersById.get(subject);
-            if (externalUser == null) {
-                if (remove) {
-                    wiki.deleteDocument(userDoc, wikiContext);
-                }
-                continue;
-            }
-            if (disable && !externalUser.isEnabled()) {
-                BaseObject oidcObj = userDoc.getXObject(documentReferenceResolver.resolve(USER_CLASS));
-                oidcObj.set("active", 0, wikiContext);
-                wiki.saveDocument(userDoc, SAVE_MESSAGE, wikiContext);
+        // This is reached only once every page was handled, otherwise the users of a missing page would be removed.
+        if (remove) {
+            XWikiContext wikiContext = this.wikiContextProvider.get();
+            XWiki wiki = wikiContext.getWiki();
+            for (DocumentReference userReference : missingUsers.values()) {
+                wiki.deleteDocument(wiki.getDocument(userReference, wikiContext), wikiContext);
             }
         }
+    }
+
+    private void syncUsersPage(List<ExternalUser> externalUsers, Map<String, DocumentReference> missingUsers,
+        boolean disable) throws XWikiException
+    {
+        for (ExternalUser externalUser : externalUsers) {
+            DocumentReference userReference = missingUsers.remove(externalUser.getId());
+            if (userReference != null && disable && !externalUser.isEnabled()) {
+                disableUser(userReference);
+            }
+        }
+    }
+
+    private void disableUser(DocumentReference userReference) throws XWikiException
+    {
+        XWikiContext wikiContext = this.wikiContextProvider.get();
+        XWiki wiki = wikiContext.getWiki();
+        XWikiDocument userDoc = wiki.getDocument(userReference, wikiContext);
+        BaseObject userObj = userDoc.getXObject(this.documentReferenceResolver.resolve(USER_CLASS));
+        userObj.set("active", 0, wikiContext);
+        wiki.saveDocument(userDoc, SAVE_MESSAGE, wikiContext);
     }
 }

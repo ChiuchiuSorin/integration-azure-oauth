@@ -22,10 +22,13 @@ package com.xwiki.azureoauth.internal;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
-import org.json.JSONArray;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
@@ -34,12 +37,16 @@ import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
 
 import com.xwiki.azureoauth.configuration.EntraIDClientConfiguration;
+import com.xwiki.azureoauth.user.ExternalUser;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -50,7 +57,13 @@ import static org.mockito.Mockito.when;
 @ComponentTest
 class EntraIDApiClientTest
 {
-    private static final String USERS_API = "https://graph.microsoft.com/v1.0/users?$select=id,accountEnabled";
+    private static final String USERS_API = "https://graph.microsoft.com/v1.0/users?$select=id,accountEnabled&$top=999";
+
+    private static final String NEXT_LINK = USERS_API + "&$skiptoken=page2";
+
+    private static final String GRAPH_ERROR = "Graph request did not return a valid response.";
+
+    private final List<List<ExternalUser>> pages = new ArrayList<>();
 
     @Mock
     HttpClient httpClient;
@@ -85,96 +98,155 @@ class EntraIDApiClientTest
     }
 
     @Test
-    void getEntraUsersJsonMapTestFailToGetAccessToken()
+    void forEachUsersPageFailToGetAccessToken()
     {
         when(this.httpResponse.statusCode()).thenReturn(500);
         RuntimeException exception = assertThrows(RuntimeException.class, () -> {
-            this.entraIDApiClient.getUsers(this.configuration);
+            this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
         });
         assertEquals("Failed to get token", exception.getMessage());
     }
 
     @Test
-    void getEntraUsersJsonMapTestGraphError() throws IOException, InterruptedException
+    void forEachUsersPageGraphError() throws IOException, InterruptedException
     {
-        when(this.httpResponse.statusCode()).thenReturn(200);
-        String jsonBody = "{ \"access_token\": \"test-token-123\" }";
-
-        when(this.httpResponse.body()).thenReturn(jsonBody);
+        mockAccessToken();
         when(this.httpClient.send(eq(getGraphRequest(USERS_API)), any(HttpResponse.BodyHandler.class))).thenReturn(
             this.httpResponse2);
         when(this.httpResponse2.statusCode()).thenReturn(500);
         RuntimeException exception = assertThrows(RuntimeException.class, () -> {
-            this.entraIDApiClient.getUsers(this.configuration);
+            this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
         });
 
-        assertEquals("Graph request did not return a valid response.", exception.getMessage());
+        assertEquals(GRAPH_ERROR, exception.getMessage());
+        assertEquals(List.of(), this.pages);
     }
 
     @Test
-    void getEntraUsersJsonMapTest() throws Exception
+    void forEachUsersPage() throws Exception
     {
         when(this.httpResponse.statusCode()).thenReturn(200);
         String jsonBody = "{ \"access_token\": \"test-token-123\", \"value\": ["
             + "{ \"id\": \"user1\", \"accountEnabled\": true },{ \"id\": \"user2\", \"accountEnabled\": false },"
             + "{ \"id\": \"user3\", \"accountEnabled\": true }]}";
-
         when(this.httpResponse.body()).thenReturn(jsonBody);
-        JSONArray jsonArray = this.entraIDApiClient.getUsers(this.configuration);
-        assertEquals("user1", jsonArray.getJSONObject(0).optString("id"));
-        assertFalse(jsonArray.getJSONObject(1).optBoolean("accountEnabled"));
-        assertEquals("user3", jsonArray.getJSONObject(2).optString("id"));
+
+        this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
+
+        assertEquals(1, this.pages.size());
+        List<ExternalUser> users = this.pages.get(0);
+        assertEquals("user1", users.get(0).getId());
+        assertTrue(users.get(0).isEnabled());
+        assertFalse(users.get(1).isEnabled());
+        assertEquals("user3", users.get(2).getId());
     }
 
     @Test
-    void getEntraUsersJsonMapTestWithPagination() throws Exception
+    void forEachUsersPageWithPagination() throws Exception
     {
-        when(this.httpResponse.statusCode()).thenReturn(200);
-        when(this.httpResponse.body()).thenReturn("{ \"access_token\": \"test-token-123\" }");
-
-        String nextLink = USERS_API + "&$skiptoken=page2";
-        when(this.httpClient.send(eq(getGraphRequest(USERS_API)), any(HttpResponse.BodyHandler.class))).thenReturn(
-            this.httpResponse2);
-        when(this.httpResponse2.statusCode()).thenReturn(200);
-        when(this.httpResponse2.body()).thenReturn("{ \"value\": ["
+        mockAccessToken();
+        mockGraphResponse(USERS_API, this.httpResponse2, 200, "{ \"value\": ["
             + "{ \"id\": \"user1\", \"accountEnabled\": true },{ \"id\": \"user2\", \"accountEnabled\": false }],"
-            + " \"@odata.nextLink\": \"" + nextLink + "\" }");
+            + " \"@odata.nextLink\": \"" + NEXT_LINK + "\" }");
+        mockGraphResponse(NEXT_LINK, this.httpResponse3, 200,
+            "{ \"value\": [{ \"id\": \"user3\", \"accountEnabled\": true }]}");
 
-        when(this.httpClient.send(eq(getGraphRequest(nextLink)), any(HttpResponse.BodyHandler.class))).thenReturn(
-            this.httpResponse3);
-        when(this.httpResponse3.statusCode()).thenReturn(200);
-        when(this.httpResponse3.body()).thenReturn("{ \"value\": [{ \"id\": \"user3\", \"accountEnabled\": true }]}");
+        this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
 
-        JSONArray jsonArray = this.entraIDApiClient.getUsers(this.configuration);
-        assertEquals(3, jsonArray.length());
-        assertEquals("user1", jsonArray.getJSONObject(0).optString("id"));
-        assertFalse(jsonArray.getJSONObject(1).optBoolean("accountEnabled"));
-        assertEquals("user3", jsonArray.getJSONObject(2).optString("id"));
+        // Each page is handled separately.
+        assertEquals(2, this.pages.size());
+        assertEquals(2, this.pages.get(0).size());
+        assertEquals("user1", this.pages.get(0).get(0).getId());
+        assertFalse(this.pages.get(0).get(1).isEnabled());
+        assertEquals(1, this.pages.get(1).size());
+        assertEquals("user3", this.pages.get(1).get(0).getId());
     }
 
     @Test
-    void getEntraUsersJsonMapTestGraphErrorOnNextPage() throws Exception
+    void forEachUsersPageGraphErrorOnNextPage() throws Exception
+    {
+        mockAccessToken();
+        mockGraphResponse(USERS_API, this.httpResponse2, 200,
+            "{ \"value\": [{ \"id\": \"user1\", \"accountEnabled\": true }]," + " \"@odata.nextLink\": \"" + NEXT_LINK
+                + "\" }");
+        mockGraphResponse(NEXT_LINK, this.httpResponse3, 500, null);
+
+        // A failing page must fail the whole call, so that the callers know that some users are missing.
+        RuntimeException exception = assertThrows(RuntimeException.class, () -> {
+            this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
+        });
+        assertEquals(GRAPH_ERROR, exception.getMessage());
+        assertEquals(1, this.pages.size());
+    }
+
+    @Test
+    void forEachUsersPageRetriesWhenThrottled() throws Exception
+    {
+        mockAccessToken();
+        when(this.httpClient.send(eq(getGraphRequest(USERS_API)), any(HttpResponse.BodyHandler.class))).thenReturn(
+            this.httpResponse2, this.httpResponse3);
+        when(this.httpResponse2.statusCode()).thenReturn(429);
+        when(this.httpResponse2.headers()).thenReturn(getRetryAfterHeaders("0"));
+        when(this.httpResponse3.statusCode()).thenReturn(200);
+        when(this.httpResponse3.body()).thenReturn("{ \"value\": [{ \"id\": \"user1\", \"accountEnabled\": true }]}");
+
+        this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
+
+        assertEquals(1, this.pages.size());
+        assertEquals("user1", this.pages.get(0).get(0).getId());
+    }
+
+    @Test
+    void forEachUsersPageRetriesWithoutRetryAfter() throws Exception
+    {
+        mockAccessToken();
+        when(this.httpClient.send(eq(getGraphRequest(USERS_API)), any(HttpResponse.BodyHandler.class))).thenReturn(
+            this.httpResponse2, this.httpResponse3);
+        when(this.httpResponse2.statusCode()).thenReturn(503);
+        when(this.httpResponse2.headers()).thenReturn(HttpHeaders.of(Map.of(), (name, value) -> true));
+        when(this.httpResponse3.statusCode()).thenReturn(200);
+        when(this.httpResponse3.body()).thenReturn("{ \"value\": []}");
+
+        this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
+
+        assertEquals(1, this.pages.size());
+        assertEquals(List.of(), this.pages.get(0));
+    }
+
+    @Test
+    void forEachUsersPageStopsRetrying() throws Exception
+    {
+        mockAccessToken();
+        mockGraphResponse(USERS_API, this.httpResponse2, 429, null);
+        when(this.httpResponse2.headers()).thenReturn(getRetryAfterHeaders("0"));
+
+        RuntimeException exception = assertThrows(RuntimeException.class, () -> {
+            this.entraIDApiClient.forEachUsersPage(this.configuration, this.pages::add);
+        });
+
+        assertEquals(GRAPH_ERROR, exception.getMessage());
+        // The first attempt and 5 retries.
+        verify(this.httpClient, times(6)).send(eq(getGraphRequest(USERS_API)), any(HttpResponse.BodyHandler.class));
+        assertEquals(List.of(), this.pages);
+    }
+
+    private void mockAccessToken()
     {
         when(this.httpResponse.statusCode()).thenReturn(200);
         when(this.httpResponse.body()).thenReturn("{ \"access_token\": \"test-token-123\" }");
+    }
 
-        String nextLink = USERS_API + "&$skiptoken=page2";
-        when(this.httpClient.send(eq(getGraphRequest(USERS_API)), any(HttpResponse.BodyHandler.class))).thenReturn(
-            this.httpResponse2);
-        when(this.httpResponse2.statusCode()).thenReturn(200);
-        when(this.httpResponse2.body()).thenReturn(
-            "{ \"value\": [{ \"id\": \"user1\", \"accountEnabled\": true }]," + " \"@odata.nextLink\": \"" + nextLink
-                + "\" }");
+    private void mockGraphResponse(String url, HttpResponse<String> response, int statusCode, String body)
+        throws IOException, InterruptedException
+    {
+        when(this.httpClient.send(eq(getGraphRequest(url)), any(HttpResponse.BodyHandler.class))).thenReturn(response);
+        when(response.statusCode()).thenReturn(statusCode);
+        when(response.body()).thenReturn(body);
+    }
 
-        when(this.httpClient.send(eq(getGraphRequest(nextLink)), any(HttpResponse.BodyHandler.class))).thenReturn(
-            this.httpResponse3);
-        when(this.httpResponse3.statusCode()).thenReturn(500);
-
-        // A failing page must fail the whole call, otherwise the sync would remove the users of the missing pages.
-        RuntimeException exception = assertThrows(RuntimeException.class, () -> {
-            this.entraIDApiClient.getUsers(this.configuration);
-        });
-        assertEquals("Graph request did not return a valid response.", exception.getMessage());
+    private HttpHeaders getRetryAfterHeaders(String retryAfter)
+    {
+        return HttpHeaders.of(Map.of("Retry-After", List.of(retryAfter)), (name, value) -> true);
     }
 
     private HttpRequest getGraphRequest(String url)
