@@ -19,6 +19,7 @@
  */
 package com.xwiki.azureoauth.internal;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -29,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 
+import org.apache.commons.lang3.StringUtils;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.xwiki.component.annotation.Component;
@@ -46,6 +48,8 @@ import com.xwiki.azureoauth.configuration.EntraIDClientConfiguration;
 @Singleton
 public class EntraIDApiClient
 {
+    private static final String ODATA_NEXT_LINK = "@odata.nextLink";
+
     private static final String USERS_API = "https://graph.microsoft.com/v1.0/users?$select=id,accountEnabled";
 
     @Inject
@@ -63,18 +67,31 @@ public class EntraIDApiClient
     {
         String accessToken = getAccessToken(clientConfiguration.getTokenEndpoint(), clientConfiguration.getClientID(),
             clientConfiguration.getSecret());
-        HttpRequest request =
-            HttpRequest.newBuilder().uri(URI.create(USERS_API)).header("Authorization", "Bearer " + accessToken).GET()
-                .build();
+        HttpClient client = this.httpClientBuilderFactory.getHttpClient();
 
-        HttpClient client = httpClientBuilderFactory.getHttpClient();
+        JSONArray users = new JSONArray();
+        String nextLink = USERS_API;
+        while (!StringUtils.isBlank(nextLink)) {
+            JSONObject page = getUsersPage(client, accessToken, URI.create(nextLink));
+            JSONArray pageUsers = page.getJSONArray("value");
+            for (int i = 0; i < pageUsers.length(); i++) {
+                users.put(pageUsers.get(i));
+            }
+            nextLink = page.has(ODATA_NEXT_LINK) ? page.getString(ODATA_NEXT_LINK) : null;
+        }
+        return users;
+    }
+
+    private JSONObject getUsersPage(HttpClient client, String accessToken, URI uri)
+        throws IOException, InterruptedException
+    {
+        HttpRequest request =
+            HttpRequest.newBuilder().uri(uri).header("Authorization", "Bearer " + accessToken).GET().build();
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() != 200) {
             throw new RuntimeException("Graph request did not return a valid response.");
         }
-        JSONObject json = new JSONObject(response.body());
-
-        return json.getJSONArray("value");
+        return new JSONObject(response.body());
     }
 
     private String getAccessToken(String url, String clientID, String secret) throws Exception
@@ -88,7 +105,7 @@ public class EntraIDApiClient
         HttpRequest request =
             HttpRequest.newBuilder().uri(URI.create(url)).header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(sb.toString())).build();
-        HttpClient client = httpClientBuilderFactory.getHttpClient();
+        HttpClient client = this.httpClientBuilderFactory.getHttpClient();
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() != 200) {
